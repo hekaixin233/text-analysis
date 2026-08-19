@@ -11,11 +11,20 @@ import pandas as pd
 import seaborn as sns
 
 from .comparison import _corpus_identity, _display_name
+from .reader import read_text
 from .reporting import _configure_style
+from .style_words import STYLE_WORDS, count_style_words, style_word_rows
 
 AI_COLOR = "#7A5AF8"
 HUMAN_COLOR = "#E58B3A"
 GROUP_ORDER = ["人类", "AI"]
+AI_FAMILIES = {
+    "ChatGPT": "chatgpt",
+    "Codex": "codex",
+    "DeepSeek": "deepseek",
+    "Gemini": "gemini",
+    "Grok": "grok",
+}
 FEATURES = [
     "平均句长",
     "句长变异系数",
@@ -24,6 +33,8 @@ FEATURES = [
     "Top10词集中度（%）",
     "词汇归一化熵",
     "一次词占比（%）",
+    "风格词密度（每万字）",
+    "风格词类型覆盖率（%）",
 ]
 
 
@@ -44,11 +55,15 @@ def _load_features(output_root: Path, destination: Path) -> tuple[pd.DataFrame, 
         counts = words["次数"].to_numpy(dtype=float)
         probabilities = counts / counts.sum() if counts.sum() else np.array([])
         entropy = float(-(probabilities * np.log(probabilities)).sum() / np.log(len(probabilities))) if len(probabilities) > 1 else 0
+        source_text, _ = read_text(Path(payload["metadata"]["file"]), payload["metadata"].get("encoding"))
+        style_counts = count_style_words(source_text)
+        style_total = sum(style_counts.values())
         distribution = payload["sentence_distribution"]
         total_sentences = payload["total_sentences"]
         mean_length = float(lengths.mean())
         rows.append({
             "语料ID": corpus_id,
+            "结果目录": summary_path.parent.relative_to(output_root).as_posix(),
             "语料": _display_name(group, corpus),
             "组别": authorship,
             "有效字数": payload["total_characters"],
@@ -62,6 +77,8 @@ def _load_features(output_root: Path, destination: Path) -> tuple[pd.DataFrame, 
             "Top10词集中度（%）": counts[:10].sum() / counts.sum() * 100 if counts.sum() else 0,
             "词汇归一化熵": entropy,
             "一次词占比（%）": (counts == 1).sum() / len(counts) * 100 if len(counts) else 0,
+            "风格词密度（每万字）": style_total / payload["total_characters"] * 10_000,
+            "风格词类型覆盖率（%）": len(style_counts) / len(STYLE_WORDS) * 100,
         })
         rate_column = "每万字次数" if "每万字次数" in words.columns else "每万字出现次数"
         word_records.append(pd.DataFrame({
@@ -109,8 +126,15 @@ def _separability_table(matched: pd.DataFrame) -> pd.DataFrame:
 
 def _plot_feature_distributions(matched: pd.DataFrame, destination: Path) -> None:
     _configure_style()
-    metrics = ["平均句长", "句长变异系数", "Top10词集中度（%）", "词汇归一化熵"]
-    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+    metrics = [
+        "平均句长",
+        "句长变异系数",
+        "Top10词集中度（%）",
+        "词汇归一化熵",
+        "风格词密度（每万字）",
+        "风格词类型覆盖率（%）",
+    ]
+    fig, axes = plt.subplots(3, 2, figsize=(12, 13))
     palette = {"人类": HUMAN_COLOR, "AI": AI_COLOR}
     for axis, metric in zip(axes.flat, metrics):
         sns.boxplot(data=matched, x="组别", y=metric, order=GROUP_ORDER, hue="组别", palette=palette, width=0.5, showfliers=False, legend=False, ax=axis)
@@ -147,6 +171,191 @@ def _plot_separability(table: pd.DataFrame, destination: Path) -> None:
     fig.tight_layout()
     fig.savefig(destination / "single_feature_separability.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
+
+
+def _select_representative_corpora(matched: pd.DataFrame, count: int = 3) -> pd.DataFrame:
+    """Select corpora nearest each group's multivariate median style profile."""
+    selected: list[pd.DataFrame] = []
+    for group in GROUP_ORDER:
+        subset = matched[matched["组别"] == group].copy()
+        values = subset[FEATURES].astype(float)
+        median = values.median()
+        scale = (values.quantile(0.75) - values.quantile(0.25)).replace(0, 1)
+        subset["代表性距离"] = (((values - median) / scale) ** 2).mean(axis=1) ** 0.5
+        subset["组内代表性排名"] = subset["代表性距离"].rank(method="first").astype(int)
+        selected.append(subset.nsmallest(min(count, len(subset)), "代表性距离"))
+    return pd.concat(selected, ignore_index=True)
+
+
+def _robust_style_coordinates(frame: pd.DataFrame) -> pd.DataFrame:
+    values = frame[FEATURES].astype(float)
+    scale = (values.quantile(0.75) - values.quantile(0.25)).replace(0, 1)
+    return (values - values.median()) / scale
+
+
+def _select_cross_model_and_distinctive_corpora(
+    features: pd.DataFrame,
+    count: int = 5,
+) -> pd.DataFrame:
+    """Pick one medoid-like sample per AI family and diverse human samples."""
+    ai = features[features["组别"] == "AI"].copy()
+    ai_selected: list[pd.Series] = []
+    for family, prefix in AI_FAMILIES.items():
+        family_rows = ai[ai["语料ID"].str.split("/").str[-1].str.casefold().str.startswith(prefix)]
+        if family_rows.empty:
+            continue
+        coordinates = _robust_style_coordinates(family_rows)
+        distance = (coordinates**2).mean(axis=1) ** 0.5
+        row = family_rows.loc[distance.idxmin()].copy()
+        row["选择依据"] = f"{family} 家族中心样本"
+        row["显示标签"] = f"{family} · {str(row['语料ID']).split('/')[-1]}"
+        ai_selected.append(row)
+    ai_frame = pd.DataFrame(ai_selected).head(count)
+    ai_frame["组内代表性排名"] = range(1, len(ai_frame) + 1)
+
+    human = features[(features["组别"] == "人类") & (features["有效字数"] >= 3_000)].copy()
+    coordinates = _robust_style_coordinates(human)
+    remaining = list(human.index)
+    chosen: list[int] = []
+    while remaining and len(chosen) < count:
+        if not chosen:
+            distances = (coordinates.loc[remaining] ** 2).mean(axis=1) ** 0.5
+        else:
+            distances = pd.Series(
+                {
+                    index: min(
+                        float(np.sqrt(((coordinates.loc[index] - coordinates.loc[other]) ** 2).mean()))
+                        for other in chosen
+                    )
+                    for index in remaining
+                }
+            )
+        selected_index = int(distances.idxmax())
+        chosen.append(selected_index)
+        remaining.remove(selected_index)
+    human_frame = human.loc[chosen].copy()
+    human_frame["选择依据"] = ["偏离组内中心最明显"] + ["与已选作品风格距离最大"] * (len(human_frame) - 1)
+    human_frame["显示标签"] = human_frame["语料"].str.split("/", n=1).str[-1]
+    human_frame["组内代表性排名"] = range(1, len(human_frame) + 1)
+    return pd.concat([human_frame, ai_frame], ignore_index=True)
+
+
+def _plot_representative_word_frequencies(
+    words: pd.DataFrame,
+    representatives: pd.DataFrame,
+    destination: Path,
+    top_n: int = 10,
+    filename: str = "representative_corpus_word_frequencies.png",
+    title: str = "AI 与人类代表语料高频词对比",
+) -> None:
+    """Plot directly comparable top-word bars for representative corpora."""
+    _configure_style()
+    rows = len(representatives[representatives["组别"] == "人类"])
+    columns = 2
+    fig, axes = plt.subplots(rows, columns, figsize=(14, max(8, rows * 4.2)), squeeze=False)
+    global_max = 0.0
+    panels: list[tuple[object, pd.DataFrame, pd.Series]] = []
+    for column, group in enumerate(GROUP_ORDER):
+        group_representatives = representatives[representatives["组别"] == group].sort_values("组内代表性排名")
+        for row, (_, corpus) in enumerate(group_representatives.iterrows()):
+            top = (
+                words[words["语料ID"] == corpus["语料ID"]]
+                .nlargest(top_n, "每万字次数")
+                .sort_values("每万字次数")
+            )
+            global_max = max(global_max, float(top["每万字次数"].max()))
+            panels.append((axes[row, column], top, corpus))
+
+    for axis, top, corpus in panels:
+        color = AI_COLOR if corpus["组别"] == "AI" else HUMAN_COLOR
+        bars = axis.barh(top["词语"], top["每万字次数"], color=color, alpha=0.9)
+        axis.bar_label(bars, fmt="%.1f", padding=3, fontsize=8)
+        short_name = corpus.get("显示标签", str(corpus["语料"]).split("/", 1)[-1])
+        axis.set(
+            title=f"{corpus['组别']}｜{short_name}",
+            xlabel="每万字次数",
+            ylabel="",
+            xlim=(0, global_max * 1.15),
+        )
+        axis.grid(axis="x", alpha=0.22)
+        axis.grid(axis="y", visible=False)
+        sns.despine(ax=axis, left=True)
+    fig.suptitle(
+        f"{title}（各 {rows} 篇，每篇 Top {top_n}）",
+        fontsize=16,
+        fontweight="bold",
+        y=0.998,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.975))
+    fig.savefig(destination / filename, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _representative_style_word_analysis(
+    output_root: Path,
+    representatives: pd.DataFrame,
+    destination: Path,
+    top_n: int = 15,
+    table_filename: str = "representative_style_word_frequencies.csv",
+    chart_filename: str = "representative_style_word_frequencies.png",
+    title: str = "AI 与人类代表语料“风格词”对比",
+) -> pd.DataFrame:
+    """Create reference-style tables and comparable plots for style words."""
+    frames: list[pd.DataFrame] = []
+    for _, corpus in representatives.iterrows():
+        result_directory = str(corpus.get("结果目录", corpus["语料ID"]))
+        summary_path = output_root.joinpath(*result_directory.split("/"), "summary.json")
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        source_path = Path(payload["metadata"]["file"])
+        text, _ = read_text(source_path, payload["metadata"].get("encoding"))
+        frame = pd.DataFrame(style_word_rows(text))
+        if frame.empty:
+            continue
+        frame.insert(0, "语料", corpus["语料"])
+        frame.insert(0, "组别", corpus["组别"])
+        frame.insert(0, "语料ID", corpus["语料ID"])
+        frames.append(frame)
+    combined = pd.concat(frames, ignore_index=True)
+    combined.to_csv(destination / table_filename, index=False, encoding="utf-8-sig")
+
+    rows = representatives.groupby("组别").size().min()
+    fig, axes = plt.subplots(rows, 2, figsize=(14, max(10, rows * 5.2)), squeeze=False)
+    panels: list[tuple[object, pd.DataFrame, pd.Series]] = []
+    global_max = 0.0
+    for column, group in enumerate(GROUP_ORDER):
+        group_rows = representatives[representatives["组别"] == group].sort_values("组内代表性排名").head(rows)
+        for row, (_, corpus) in enumerate(group_rows.iterrows()):
+            top = (
+                combined[combined["语料ID"] == corpus["语料ID"]]
+                .nsmallest(top_n, "排名")
+                .sort_values("每万字次数")
+            )
+            global_max = max(global_max, float(top["每万字次数"].max()))
+            panels.append((axes[row, column], top, corpus))
+    for axis, top, corpus in panels:
+        color = AI_COLOR if corpus["组别"] == "AI" else HUMAN_COLOR
+        bars = axis.barh(top["词语"], top["每万字次数"], color=color, alpha=0.9)
+        axis.bar_label(bars, fmt="%.1f", padding=3, fontsize=8)
+        short_name = corpus.get("显示标签", str(corpus["语料"]).split("/", 1)[-1])
+        axis.set(
+            title=f"{corpus['组别']}｜{short_name}",
+            xlabel="每万字次数",
+            ylabel="",
+            xlim=(0, global_max * 1.16),
+        )
+        axis.grid(axis="x", alpha=0.22)
+        axis.grid(axis="y", visible=False)
+        sns.despine(ax=axis, left=True)
+    fig.suptitle(
+        f"{title}（各 {rows} 篇，每篇 Top {top_n}）",
+        fontsize=16,
+        fontweight="bold",
+        y=0.998,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.975))
+    fig.savefig(destination / chart_filename, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return combined
 
 
 def _word_difference(words: pd.DataFrame, matched: pd.DataFrame, destination: Path) -> pd.DataFrame:
@@ -207,11 +416,32 @@ def build_authorship_report(output_root: Path, destination: Path) -> tuple[pd.Da
     features, words = _load_features(output_root, destination)
     matched = _length_matched_sample(features)
     separability = _separability_table(matched)
+    representatives = _select_representative_corpora(matched)
+    diverse_corpora = _select_cross_model_and_distinctive_corpora(features)
     features.to_csv(destination / "all_corpus_features.csv", index=False, encoding="utf-8-sig")
     matched.to_csv(destination / "length_matched_features.csv", index=False, encoding="utf-8-sig")
     separability.to_csv(destination / "single_feature_separability.csv", index=False, encoding="utf-8-sig")
+    representatives.to_csv(destination / "representative_corpora.csv", index=False, encoding="utf-8-sig")
+    diverse_corpora.to_csv(destination / "cross_model_distinctive_corpora.csv", index=False, encoding="utf-8-sig")
     _plot_feature_distributions(matched, destination)
     _plot_separability(separability, destination)
+    _plot_representative_word_frequencies(words, representatives, destination)
+    _representative_style_word_analysis(output_root, representatives, destination)
+    _plot_representative_word_frequencies(
+        words,
+        diverse_corpora,
+        destination,
+        filename="cross_model_distinctive_word_frequencies.png",
+        title="不同 AI 模型与特色人类语料高频词对比",
+    )
+    _representative_style_word_analysis(
+        output_root,
+        diverse_corpora,
+        destination,
+        table_filename="cross_model_distinctive_style_word_frequencies.csv",
+        chart_filename="cross_model_distinctive_style_word_frequencies.png",
+        title="不同 AI 模型与特色人类语料“风格词”对比",
+    )
     _word_difference(words, matched, destination)
     _write_interpretation(destination, features, matched, separability)
     return features, separability

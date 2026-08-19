@@ -1,6 +1,6 @@
 # 中文文本分析
 
-一个模块化、可复用的 Python 项目，用于逐个分析中文语料的标准化词频和句长分布，并生成 CSV、JSON 与 PNG 报告。
+一个模块化、可复用的 Python 项目，用于逐个分析中文语料的标准化词频和句长分布，并探索 AI 与人类写作的风格差异。
 
 ## 快速开始
 
@@ -18,7 +18,7 @@ uv run text-compare output -o output/comparison
 uv run text-authorship output -o output/comparison/ai_vs_human
 ```
 
-默认递归分析 `text/` 下的 `*.txt`，每个语料的结果分别写入 `output/<语料名>/`。程序自动尝试 UTF-8、GB18030 和 Big5 编码。
+默认递归分析 `text/` 下的 `*.txt`。程序自动尝试 UTF-8、GB18030 和 Big5 编码。
 
 自定义输入、阈值和高频词数量：
 
@@ -40,24 +40,7 @@ uv run text-analysis text --stopwords stopwords.txt
 - 句长：统计句内中文、字母和数字的字符数，不计空白及标点。
 - 默认分类：短句不超过 15 字，中句 16–30 字，长句超过 30 字。
 
-## 输出文件
-
-- `word_frequencies.csv`：参考式词频表（排名、词语、次数、每万字次数、正文占比）
-- `sentence_distribution.csv`：三类句子的数量和占比
-- `sentence_lengths.csv`：每个句子的字符长度
-- `summary.json`：摘要、阈值、源文件及编码信息
-- `word_frequency.png`：高频词图
-- `sentence_distribution.png`：句型分布图
-- `sentence_length_histogram.png`：句长直方图（展示至 99.5% 分位，避免极端值压缩主体）
-
-跨语料比较结果位于 `output/comparison/`：
-
-- `corpus_summary.csv`：字数、词数、句数、平均句长及三类句子占比
-- `top_words_comparison.csv`：所有语料 Top 词的统一长表
-- `top_words_heatmap.png`：标准化高频词热力图
-- `sentence_profile_comparison.png`：短、中、长句 100% 堆叠对比图
-
-AI 与人类写作的探索性比较位于 `output/comparison/ai_vs_human/`。分析采用按有效字数一对一匹配，比较词汇集中度、词汇熵、句长均值和句长离散程度；这些特征只能提供风格线索，不能单独作为 AI 写作判定依据。
+AI 与人类写作的探索性比较采用按有效字数一对一匹配，比较词汇集中度、词汇熵、代表语料高频词、“风格词”、句长均值和句长离散程度。对比样本既可按组内中位风格选择，也可从 ChatGPT、Codex、DeepSeek、Gemini、Grok 各选一个家族中心样本，并用多维风格距离选取分布差异较大的人类作品。“风格词”采用可复用词表统计转折衔接、程度判断、时间推进及叙述动作表达，不显示词性。这些特征只能提供风格线索，不能单独作为 AI 写作判定依据。
 
 核心 API 可以直接复用：
 
